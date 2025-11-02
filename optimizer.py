@@ -172,9 +172,57 @@ def passes_panel_constraints(coords_norm):
 # ---------- WRAPPER AROUND YOUR CURRENT MODEL ----------
 def solve_one_airfoil(wing_airfoil_obj, cache_basename="soln"):
     """
-    Rebuilds your model for a given wing_airfoil, caps iterations at 100, and returns a dict of results.
-    This is your current script, lightly wrapped and with prints removed. Keep your physics as-is.
+    Rebuilds your model for a given wing_airfoil, caps iterations at 200, and returns a dict of results.
+    Includes pre-checks to catch problematic airfoils early.
     """
+    # ==== EARLY SANITY CHECK: Test if airfoil can produce valid aerodynamics ====
+    try:
+        # Quick aero test at reasonable conditions
+        test_wing = asb.Wing(
+            name="Test",
+            symmetric=True,
+            xsecs=[
+                asb.WingXSec(xyz_le=[0, 0, 0], chord=0.4, twist=3, airfoil=wing_airfoil_obj),
+                asb.WingXSec(xyz_le=[0, 0.5, 0], chord=0.4, twist=3, airfoil=wing_airfoil_obj),
+            ]
+        )
+        test_atm = Atmosphere(1200, temperature_deviation=60.0 * (5.0/9.0))
+        test_vlm = asb.AeroBuildup(
+            airplane=asb.Airplane(name="Test", xyz_ref=[0.04, 0, 0], wings=[test_wing]),
+            op_point=asb.OperatingPoint(atmosphere=test_atm, velocity=15)
+        )
+        test_aero = test_vlm.run()
+        
+        # Check for NaN in critical outputs
+        if npx.isnan(test_aero["CL"]) or npx.isnan(test_aero["CD"]) or npx.isnan(test_aero["L"]):
+            return dict(
+                converged=False,
+                fail_reason="Airfoil failed aerodynamic pre-check (NaN in CL/CD/L)",
+                **{k: npx.nan for k in ["Airspeed", "Thrust_cruise", "Power_out_max", "Mass", 
+                   "TOGW_Design", "Weight", "CL", "CD", "L_over_D", "Lift_total", "Drag_total",
+                   "Wing_span", "Wing_chord", "Wing_AR", "Struct_defined_AoA", "Hstab_AoA",
+                   "Hstab_span", "Hstab_chord", "cg_le_dist", "Boom_length", "Wing_mass",
+                   "Fuselage_mass", "Solar_cells_num", "Solar_cell_mass", "Battery_capacity_Wh",
+                   "Battery_mass", "Battery_packs", "Wire_mass", "Motor_num", "Motor_RPM",
+                   "Motor_kV", "Propeller_diameter", "Propeller_mass", "Motors_mass", "ESCs_mass"]},
+                TOGW_Max=togw_max,
+                Avionics_mass=0.261
+            )
+    except Exception as e:
+        return dict(
+            converged=False,
+            fail_reason=f"Airfoil failed aerodynamic pre-check: {str(e)[:200]}",
+            **{k: npx.nan for k in ["Airspeed", "Thrust_cruise", "Power_out_max", "Mass",
+               "TOGW_Design", "Weight", "CL", "CD", "L_over_D", "Lift_total", "Drag_total",
+               "Wing_span", "Wing_chord", "Wing_AR", "Struct_defined_AoA", "Hstab_AoA",
+               "Hstab_span", "Hstab_chord", "cg_le_dist", "Boom_length", "Wing_mass",
+               "Fuselage_mass", "Solar_cells_num", "Solar_cell_mass", "Battery_capacity_Wh",
+               "Battery_mass", "Battery_packs", "Wire_mass", "Motor_num", "Motor_RPM",
+               "Motor_kV", "Propeller_diameter", "Propeller_mass", "Motors_mass", "ESCs_mass"]},
+            TOGW_Max=togw_max,
+            Avionics_mass=0.261
+        )
+    
     # ==== BEGIN: your model (unaltered physics/vars; only moved into a function) ====
     opti = asb.Opti(cache_filename=f"output/{cache_basename}.json")
 
@@ -383,7 +431,7 @@ def solve_one_airfoil(wing_airfoil_obj, cache_basename="soln"):
     opti.subject_to(chordlen_local >= solar_panels_n_rows_local * 0.13 + 0.1)
     opti.subject_to(wing_airfoil_local.max_thickness() * chordlen_local >= 0.030)
     opti.subject_to(wingspan_local >= 0.13 * solar_panels_n_local / solar_panels_n_rows_local)
-    opti.subject_to(chordlen_local <= 0.6)
+    # NOTE: No upper bound on chord in original code
     opti.subject_to(cg_le_dist_local <= 0.25 * chordlen_local)
     opti.subject_to(battery_states_local > battery_capacity_local * (1-allowable_battery_depth_of_discharge_local))
     opti.subject_to(battery_states_local[0] <= battery_states_local[N_local-1])
@@ -395,16 +443,20 @@ def solve_one_airfoil(wing_airfoil_obj, cache_basename="soln"):
     try:
         opti.solver_options["ipopt"] = opti.solver_options.get("ipopt", {})
         ip = opti.solver_options["ipopt"]
-        ip["max_iter"] = 250
+        ip["max_iter"] = 200                     # Reduced from 250 - fail faster on bad airfoils
+        ip["max_cpu_time"] = 120.0              # 2 minute timeout per airfoil
         ip["tol"] = 1e-6
-        ip["acceptable_tol"] = 1e-3              # Relaxed from 1e-4 to handle difficult cases
-        ip["acceptable_iter"] = 10               # Increased from 5
+        ip["acceptable_tol"] = 1e-3              # Relaxed tolerance
+        ip["acceptable_iter"] = 15               # More patience for acceptable solutions
         ip["mu_strategy"] = "adaptive"
         ip["hessian_approximation"] = "limited-memory"
-        ip["print_level"] = 0
-        ip["bound_relax_factor"] = 1e-8         # Helps prevent bound violations
-        ip["honor_original_bounds"] = "yes"     # Stay within variable bounds
-        ip["nlp_scaling_method"] = "gradient-based"  # Better scaling
+        ip["print_level"] = 0                    # Suppress output
+        ip["sb"] = "yes"                         # Suppress banner
+        ip["bound_relax_factor"] = 1e-8         
+        ip["honor_original_bounds"] = "yes"     
+        ip["nlp_scaling_method"] = "gradient-based"
+        ip["diverging_iterates_tol"] = 1e10     # Detect divergence early
+        ip["skip_finalize_solution_call"] = "yes"  # Skip final checks on failure
 
     except Exception:
         pass
@@ -466,6 +518,24 @@ def solve_one_airfoil(wing_airfoil_obj, cache_basename="soln"):
 
 # ---------- MAIN SWEEP ----------
 def main():
+    import warnings
+    warnings.filterwarnings('ignore')  # Suppress Python warnings
+    
+    # Suppress CasADi warnings by redirecting stderr temporarily during solves
+    import sys
+    from contextlib import contextmanager
+    
+    @contextmanager
+    def suppress_stderr():
+        """Context manager to suppress stderr output"""
+        old_stderr = sys.stderr
+        sys.stderr = open(os.devnull, 'w')
+        try:
+            yield
+        finally:
+            sys.stderr.close()
+            sys.stderr = old_stderr
+    
     rows = []
     rejections = []
     os.makedirs("output", exist_ok=True)
@@ -474,6 +544,10 @@ def main():
     accepted = 0
     rejected = 0
     converged_cnt = 0
+    failed_aero_cnt = 0
+
+    print(f"Starting airfoil sweep: {len(airfoil_paths)} airfoils to process")
+    print("=" * 80)
 
     for dat_path in tqdm(airfoil_paths, desc="Airfoils", unit="foil"):
         try:
@@ -489,10 +563,18 @@ def main():
             rejected += 1
             continue
 
-        # Run optimizer for this airfoil
-        result = solve_one_airfoil(af, cache_basename=f"{name}_soln")
+        # Run optimizer for this airfoil (suppress CasADi warnings)
+        with suppress_stderr():
+            result = solve_one_airfoil(af, cache_basename=f"{name}_soln")
+        
         result["airfoil"] = name
-        converged_cnt += int(result["converged"])
+        
+        # Track different failure types
+        if result["converged"]:
+            converged_cnt += 1
+        elif "aerodynamic pre-check" in result.get("fail_reason", ""):
+            failed_aero_cnt += 1
+        
         # attach precheck stats
         result["min_radius_m"] = stats.get("panel_R05_m", npx.nan) if "panel_R05_m" in stats else stats.get("min_radius_m", npx.nan)
         result["max_curv_1_per_m"] = stats.get("max_curv_1_per_m", npx.nan)
@@ -510,9 +592,21 @@ def main():
     with open("airfoil_rejections.json", "w") as f:
         json.dump(rejections, f, indent=2)
 
-    print(f"Kept {len(rows)} airfoils → {CSV_OUT}")
-    print(f"Rejected {len(rejections)} airfoils → airfoil_rejections.json")
-    pass
+    print()
+    print("=" * 80)
+    print("SWEEP COMPLETE")
+    print("=" * 80)
+    print(f"Total airfoils processed:      {len(airfoil_paths)}")
+    print(f"Rejected by curvature check:   {len(rejections)}")
+    print(f"Passed to optimizer:           {len(rows)}")
+    print(f"  - Converged successfully:    {converged_cnt}")
+    print(f"  - Failed aero pre-check:     {failed_aero_cnt}")
+    print(f"  - Failed optimization:       {len(rows) - converged_cnt - failed_aero_cnt}")
+    print()
+    print(f"Success rate: {100*converged_cnt/len(rows):.1f}% of airfoils passed to optimizer")
+    print()
+    print(f"Results saved to: {CSV_OUT}")
+    print(f"Rejections saved to: airfoil_rejections.json")
 
 if __name__ == "__main__":
     # Optional: pick a start method explicitly (macOS sometimes benefits)
